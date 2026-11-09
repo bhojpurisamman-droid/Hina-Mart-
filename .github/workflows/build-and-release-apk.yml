@@ -1,0 +1,148 @@
+name: Build and Release Debug APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Publish APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Restore Keystore and Environment Config
+        run: |
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+          touch .env
+
+      - name: Build Debug APK
+        run: |
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew assembleDebug --no-daemon
+          else
+            gradle assembleDebug --no-daemon
+          fi
+
+      - name: Prepare Release Asset
+        id: prepare_release
+        run: |
+          # 1. Locate original APK without modifying it or renaming files in the repository
+          ORIGINAL_APK=$(find app/build/outputs/apk/debug -type f -name "*.apk" | head -n 1)
+          if [ -z "$ORIGINAL_APK" ] || [ ! -f "$ORIGINAL_APK" ]; then
+            echo "Error: Could not find built APK in app/build/outputs/apk/debug" >&2
+            exit 1
+          fi
+
+          echo "Original APK found at: $ORIGINAL_APK"
+
+          # 2. Extract repository name dynamically (do not hard-code)
+          RAW_REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          if [ -z "$RAW_REPO_NAME" ]; then
+            RAW_REPO_NAME="app"
+          fi
+
+          # 3. Sanitize repository name: lowercase, safe filename characters, trim hyphens
+          SAFE_REPO_NAME=$(echo "$RAW_REPO_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g' | sed -E 's/^-+|-+$//g')
+          if [ -z "$SAFE_REPO_NAME" ]; then
+            SAFE_REPO_NAME="android-app"
+          fi
+
+          # 4. Construct release filename: repository-name-debug-build-run-number.apk
+          RELEASE_FILENAME="${SAFE_REPO_NAME}-debug-build-${GITHUB_RUN_NUMBER}.apk"
+          echo "Release filename: $RELEASE_FILENAME"
+
+          # 5. Create a separate release directory so original APK is preserved and repo files are unchanged
+          RELEASE_DIR="${RUNNER_TEMP}/release-assets"
+          mkdir -p "$RELEASE_DIR"
+          RELEASE_ASSET_PATH="${RELEASE_DIR}/${RELEASE_FILENAME}"
+
+          # Copy APK directly without compression, zipping, or modifying the original
+          cp "$ORIGINAL_APK" "$RELEASE_ASSET_PATH"
+
+          # 6. Construct dynamic release tag: debug-apk-build-GITHUB_RUN_NUMBER-GITHUB_RUN_ATTEMPT
+          RELEASE_TAG="debug-apk-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          echo "Dynamic release tag: $RELEASE_TAG"
+
+          # 7. Export outputs for subsequent steps
+          echo "asset_path=${RELEASE_ASSET_PATH}" >> "$GITHUB_OUTPUT"
+          echo "asset_name=${RELEASE_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare_release.outputs.asset_name }}
+          path: ${{ steps.prepare_release.outputs.asset_path }}
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 1. Run gh --version and confirm GitHub CLI is available
+          echo "=== Step 1: Checking GitHub CLI availability ==="
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "Error: GitHub CLI (gh) is not available in PATH." >&2
+            exit 1
+          fi
+          gh --version
+
+          # 2. Confirm that the prepared release asset exists
+          echo "=== Step 2: Confirming release asset exists ==="
+          ASSET_PATH="${{ steps.prepare_release.outputs.asset_path }}"
+          echo "Release asset path: $ASSET_PATH"
+          if [ ! -f "$ASSET_PATH" ]; then
+            echo "Error: Release asset does not exist at '$ASSET_PATH'." >&2
+            exit 1
+          fi
+
+          # 3. Confirm that the release asset is a non-empty .apk file
+          echo "=== Step 3: Validating release asset ==="
+          case "$ASSET_PATH" in
+            *.apk)
+              echo "Valid .apk extension confirmed."
+              ;;
+            *)
+              echo "Error: Release asset '$ASSET_PATH' does not have a .apk extension." >&2
+              exit 1
+              ;;
+          esac
+
+          if [ ! -s "$ASSET_PATH" ]; then
+            echo "Error: Release asset '$ASSET_PATH' is empty (0 bytes)." >&2
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s "$ASSET_PATH" 2>/dev/null || wc -c < "$ASSET_PATH")
+          echo "APK validation successful. File size: $FILE_SIZE bytes."
+
+          # 4. Create release via GitHub CLI
+          echo "=== Step 4: Creating GitHub Release ==="
+          TAG="${{ steps.prepare_release.outputs.release_tag }}"
+          TITLE="Release ${TAG}"
+
+          echo "Publishing release with tag: $TAG"
+          gh release create "$TAG" "$ASSET_PATH" \
+            --title "$TITLE" \
+            --notes "Automated debug APK build from workflow run #${GITHUB_RUN_NUMBER} (attempt #${GITHUB_RUN_ATTEMPT}) on commit ${{ github.sha }}."

@@ -1,0 +1,6 @@
+{
+  "name": "Hina Mart",
+  "description": "Mobile e-commerce shopping app for Hina Mart with rich product catalog, categories, cart, checkout, orders tracking, push alerts, and admin panel.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
